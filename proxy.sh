@@ -139,7 +139,7 @@ snell_set() {
 }
 
 snell_del() { sed -i "/^${1}\s*=/d" "$SNELL_CONF"; }
-snell_port() { snell_get "listen" | grep -oE '[0-9]+' | head -1; }
+snell_port() { snell_get "listen" | grep -oE ':[0-9]+' | head -1 | tr -d ':'; }
 
 # =============================================
 # SS2022 配置读写
