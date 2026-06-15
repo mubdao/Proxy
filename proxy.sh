@@ -85,16 +85,19 @@ valid_port() {
 rand_port() { shuf -i 30000-65000 -n 1; }
 rand_pass()  { tr -dc A-Za-z0-9 </dev/urandom | head -c 24; }
 
-# 防火墙自动放行端口
+# 防火墙自动放行端口（TCP+UDP）
+# BUG FIX: 原版只放行 TCP，SS2022 的 UDP 会被拦截
 firewall_allow() {
     local port="$1"
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "$port"/tcp >/dev/null 2>&1
-        echo -e "${GREEN}已放行端口 ${port}（ufw）${PLAIN}"
+        ufw allow "$port"/udp >/dev/null 2>&1
+        echo -e "${GREEN}已放行端口 ${port} TCP+UDP（ufw）${PLAIN}"
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q "running"; then
         firewall-cmd --permanent --add-port="${port}"/tcp >/dev/null 2>&1
+        firewall-cmd --permanent --add-port="${port}"/udp >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
-        echo -e "${GREEN}已放行端口 ${port}（firewalld）${PLAIN}"
+        echo -e "${GREEN}已放行端口 ${port} TCP+UDP（firewalld）${PLAIN}"
     fi
 }
 
@@ -136,7 +139,7 @@ snell_set() {
 }
 
 snell_del() { sed -i "/^${1}\s*=/d" "$SNELL_CONF"; }
-snell_port() { snell_get "listen" | grep -oE '[0-9]+$'; }
+snell_port() { snell_get "listen" | grep -oE '[0-9]+' | head -1; }
 
 # =============================================
 # SS2022 配置读写
@@ -164,11 +167,13 @@ with open('$SS_CONF','w') as f: json.dump(d,f,indent=4)
 " 2>/dev/null
 }
 
+# BUG FIX: 原版用字符串 "True"/"False"，与 JSON bool true/false 不一致
+# 统一使用 JSON bool（python True/False）
 ss_set_bool() {
     python3 -c "
 import json
 with open('$SS_CONF') as f: d=json.load(f)
-d['$1']=$2
+d['$1']=($2)
 with open('$SS_CONF','w') as f: json.dump(d,f,indent=4)
 " 2>/dev/null
 }
@@ -182,6 +187,13 @@ with open('$SS_CONF','w') as f: json.dump(d,f,indent=4)
 " 2>/dev/null
 }
 
+# ss_get 用 python print 读取，JSON true → Python print "True"
+ss_tfo_enabled() {
+    local val
+    val=$(ss_get "fast_open")
+    [ "$val" = "True" ]
+}
+
 # =============================================
 # Surge 节点生成
 # =============================================
@@ -190,28 +202,34 @@ snell_surge_line() {
     local port=$(snell_port)
     local psk=$(snell_get "psk")
     local tfo=$(snell_get "tfo")
+    local mode=$(snell_get "mode")
+    local obfs_host=$(snell_get "obfs-host")
     local ip=$(get_ip)
     local country=$(get_country "$ip")
-    # 从二进制版本号提取大版本数字
     local bin_ver=$(snell_version)
     local ver=$(echo "$bin_ver" | grep -oE '^v[0-9]+' | tr -d 'v')
     [ -z "$ver" ] && ver="6"
     local line="${country} = snell, ${ip}, ${port}, psk = ${psk}, version = ${ver}, reuse = true, ecn = true"
     [ "$tfo" = "true" ] && line="${line}, tfo = true"
+    # mode：非 default 时才写（default 是默认值）
+    [ -n "$mode" ] && [ "$mode" != "default" ] && line="${line}, mode = ${mode}"
+    # default mode 加 obfs，obfs-host 只是客户端伪装用，服务端不校验
+    if [ -z "$mode" ] || [ "$mode" = "default" ]; then
+        line="${line}, obfs = http"
+        [ -n "$obfs_host" ] && line="${line}, obfs-host = ${obfs_host}"
+    fi
     echo "$line"
 }
 
 ss_surge_line() {
     local port=$(ss_get "server_port")
     local pass=$(ss_get "password")
-    local tfo=$(ss_get "fast_open")
     local ip=$(get_ip)
     local country=$(get_country "$ip")
     local line="${country} = ss, ${ip}, ${port}, encrypt-method = 2022-blake3-aes-128-gcm, password = ${pass}"
-    [ "$tfo" = "True" ] && line="${line}, tfo = true"
+    ss_tfo_enabled && line="${line}, tfo = true"
     echo "$line"
 }
-
 
 # =============================================
 # AnyTLS 状态检测
@@ -224,24 +242,34 @@ anytls_version() {
     anytls_installed && cat "$ANYTLS_VER_FILE" 2>/dev/null || echo "-"
 }
 
+# BUG FIX: 原版用 printf '%q' 写入，读取时没有反转义，特殊字符会乱码
+# 改为直接写值，不做 shell 转义
 anytls_conf_get() {
     [ -f "$ANYTLS_CONF" ] || return
-    grep -E "^${1}=" "$ANYTLS_CONF" 2>/dev/null | cut -d= -f2- | tr -d "'"
+    grep -E "^${1}=" "$ANYTLS_CONF" 2>/dev/null | cut -d= -f2-
 }
 
 anytls_conf_set() {
     mkdir -p "$ANYTLS_DIR"
+    # 值里如果含 = 号需要保留，用 cut -f2- 读取所以写入时直接存原始值
     if grep -qE "^${1}=" "$ANYTLS_CONF" 2>/dev/null; then
-        sed -i "s|^${1}=.*|${1}=$(printf '%q' "${2}")|" "$ANYTLS_CONF"
+        # 用 python 替换避免 sed 对特殊字符的问题
+        python3 -c "
+import re, sys
+key, val = sys.argv[1], sys.argv[2]
+with open('$ANYTLS_CONF') as f: content = f.read()
+content = re.sub(r'^' + re.escape(key) + r'=.*', key + '=' + val, content, flags=re.MULTILINE)
+with open('$ANYTLS_CONF', 'w') as f: f.write(content)
+" "$1" "$2" 2>/dev/null
     else
-        echo "${1}=$(printf '%q' "${2}")" >> "$ANYTLS_CONF"
+        echo "${1}=${2}" >> "$ANYTLS_CONF"
     fi
 }
 
 anytls_port() { anytls_conf_get "ANYTLS_LISTEN" | grep -oE '[0-9]+$'; }
 
 # =============================================
-# AnyTLS Surge节点生成
+# AnyTLS Surge 节点生成
 # =============================================
 
 anytls_surge_line() {
@@ -251,12 +279,14 @@ anytls_surge_line() {
     local ip=$(get_ip)
     local country=$(get_country "$ip")
     local line="${country} = anytls, ${ip}, ${port}, password = ${pass}, skip-cert-verify = true"
+    # BUG FIX: 严格判断 sni 非空且非空白
+    sni=$(echo "$sni" | tr -d ' ')
     [ -n "$sni" ] && line="${line}, sni = ${sni}"
     echo "$line"
 }
 
 # =============================================
-# AnyTLS scheme文件
+# AnyTLS scheme 文件
 # =============================================
 
 anytls_write_scheme() {
@@ -276,7 +306,7 @@ SCHEME
 }
 
 # =============================================
-# AnyTLS systemd服务
+# AnyTLS systemd 服务
 # =============================================
 
 anytls_write_service() {
@@ -334,7 +364,7 @@ anytls_install() {
     local pass=${inp_pass:-$def_pass}
 
     local sni="$ANYTLS_DEFAULT_SNI"
-    read -p "SNI  [默认: ${sni}，留空不发送]: " inp_sni
+    read -p "SNI  [默认: ${sni}，输入 none 不发送]: " inp_sni
     [ -n "$inp_sni" ] && sni="$inp_sni"
     [ "$inp_sni" = "none" ] && sni=""
 
@@ -362,29 +392,23 @@ anytls_install() {
     mkdir -p "$ANYTLS_DIR"
     chmod 700 "$ANYTLS_DIR"
 
-    # 写配置
+    # 直接写原始值，不做 shell 转义
     cat > "$ANYTLS_CONF" << EOF
-ANYTLS_LISTEN=$(printf '%q' "0.0.0.0:${port}")
-ANYTLS_PASSWORD=$(printf '%q' "${pass}")
-ANYTLS_CLIENT_SNI=$(printf '%q' "${sni}")
-ANYTLS_VERSION=$(printf '%q' "${ver}")
+ANYTLS_LISTEN=0.0.0.0:${port}
+ANYTLS_PASSWORD=${pass}
+ANYTLS_CLIENT_SNI=${sni}
+ANYTLS_VERSION=${ver}
 EOF
     chmod 600 "$ANYTLS_CONF"
 
-    # 写版本文件
     echo "$ver" > "$ANYTLS_VER_FILE"
-
-    # 写scheme文件
     anytls_write_scheme
-
-    # 写服务
     anytls_write_service
 
     systemctl enable anytls >/dev/null 2>&1
     systemctl start anytls
     sleep 2
 
-    # 防火墙放行
     firewall_allow "$port"
 
     if anytls_running; then
@@ -455,7 +479,8 @@ anytls_update() {
     anytls_write_service
     systemctl start anytls
     sleep 2
-    anytls_running && echo -e "${GREEN}更新成功：$(anytls_version)${PLAIN}"                    || echo -e "${RED}启动失败${PLAIN}"
+    anytls_running && echo -e "${GREEN}更新成功：$(anytls_version)${PLAIN}" \
+                   || echo -e "${RED}启动失败${PLAIN}"
 }
 
 # =============================================
@@ -464,18 +489,18 @@ anytls_update() {
 
 snell_latest_version() {
     local ver
-    # 从官方知识库页面抓取（支持 beta 后缀如 v6.0.0b2）
     ver=$(curl -s --connect-timeout 5 "https://kb.nssurge.com/surge-knowledge-base/release-notes/snell" \
         | grep -oE 'snell-server-v6\.[0-9]+\.[0-9]+[a-z]*[0-9]*-linux' \
         | grep -oE 'v6\.[0-9]+\.[0-9]+[a-z]*[0-9]*' \
         | head -1)
     [ -z "$ver" ] && ver=$(get_latest_github "passeway/Snell")
-    [ -z "$ver" ] && ver="v6.0.0b2"
+    [ -z "$ver" ] && ver="v6.0.0b3"
     echo "$ver"
 }
 
 # =============================================
 # Snell 安装
+# 新增：mode 参数支持（v6 beta3）
 # =============================================
 
 snell_install() {
@@ -506,6 +531,28 @@ snell_install() {
     local tfo="true"
     [ "${inp_tfo,,}" = "n" ] && tfo="false"
 
+    # 新增：mode 选择
+    echo ""
+    echo -e "${CYAN}选择 mode（服务端与客户端须一致）：${PLAIN}"
+    echo "  1. default    - 流量混淆 + AES 加密（推荐）"
+    echo "  2. unshaped   - 仅 AES 加密，性能提升约10%，等同 Snell v3"
+    echo "  3. unsafe-raw - 明文传输，仅限内网/安全隧道内使用"
+    read -p "请选择 [默认1]: " inp_mode
+    local mode
+    case "$inp_mode" in
+        2) mode="unshaped"   ;;
+        3) mode="unsafe-raw" ;;
+        *) mode="default"    ;;
+    esac
+
+    local obfs_host=""
+    if [ "$mode" = "default" ]; then
+        echo ""
+        read -p "Obfs Host [默认 icloud.com，输入 none 不设置]: " inp_obfs_host
+        inp_obfs_host="${inp_obfs_host:-icloud.com}"
+        [ "$inp_obfs_host" != "none" ] && obfs_host="$inp_obfs_host"
+    fi
+
     install_deps
 
     local arch=$(get_arch)
@@ -530,10 +577,16 @@ snell_install() {
 [snell-server]
 listen = 0.0.0.0:${port},[::]:${port}
 psk = ${psk}
+mode = ${mode}
 ipv6 = true
 dns-ip-preference = prefer-ipv6
 EOF
     [ "$tfo" = "true" ] && echo "tfo = true" >> "$SNELL_CONF"
+    # default mode 写入 obfs，obfs-host 供节点生成使用
+    if [ "$mode" = "default" ]; then
+        echo "obfs = http" >> "$SNELL_CONF"
+        [ -n "$obfs_host" ] && echo "obfs-host = ${obfs_host}" >> "$SNELL_CONF"
+    fi
 
     cat > "$SNELL_SERVICE" << EOF
 [Unit]
@@ -563,7 +616,6 @@ EOF
     systemctl start snell
     sleep 2
 
-    # 防火墙放行
     firewall_allow "$port"
 
     if snell_running; then
@@ -654,8 +706,8 @@ ss_install() {
     local pass=${inp_pass:-$def_pass}
 
     read -p "开启 TFO？[Y/n，默认Y]: " inp_tfo
-    local tfo="True"
-    [ "${inp_tfo,,}" = "n" ] && tfo=""
+    local tfo=True
+    [ "${inp_tfo,,}" = "n" ] && tfo=False
 
     install_deps
 
@@ -683,28 +735,20 @@ ss_install() {
 
     mkdir -p /etc/ss2022
 
-    if [ -n "$tfo" ]; then
-        cat > "$SS_CONF" << EOF
-{
-    "server": "::",
-    "server_port": ${port},
-    "password": "${pass}",
-    "method": "2022-blake3-aes-128-gcm",
-    "mode": "tcp_and_udp",
-    "fast_open": true
+    # BUG FIX: 用 python 写 JSON 确保 bool 类型正确
+    python3 -c "
+import json
+d = {
+    'server': '::',
+    'server_port': ${port},
+    'password': '${pass}',
+    'method': '2022-blake3-aes-128-gcm',
+    'mode': 'tcp_and_udp',
+    'fast_open': ${tfo}
 }
-EOF
-    else
-        cat > "$SS_CONF" << EOF
-{
-    "server": "::",
-    "server_port": ${port},
-    "password": "${pass}",
-    "method": "2022-blake3-aes-128-gcm",
-    "mode": "tcp_and_udp"
-}
-EOF
-    fi
+with open('$SS_CONF', 'w') as f:
+    json.dump(d, f, indent=4)
+"
 
     cat > "$SS_SERVICE" << EOF
 [Unit]
@@ -730,7 +774,6 @@ EOF
     systemctl start ss2022
     sleep 2
 
-    # 防火墙放行
     firewall_allow "$port"
 
     if ss_running; then
@@ -920,12 +963,17 @@ snell_modify_menu() {
         clear; hr
         local port=$(snell_port)
         local tfo=$(snell_get "tfo")
+        local mode=$(snell_get "mode")
+        local obfs_host=$(snell_get "obfs-host")
         local tfo_s; [ "$tfo" = "true" ] && tfo_s="${GREEN}开启${PLAIN}" || tfo_s="${YELLOW}关闭${PLAIN}"
-        echo -e "  修改 Snell | 端口: ${port} | TFO: ${tfo_s}"
+        [ -z "$mode" ] && mode="default"
+        echo -e "  修改 Snell | 端口: ${port} | TFO: ${tfo_s} | mode: ${mode} | obfs-host: ${obfs_host:-未设置}"
         hr
         echo "  1. 修改端口"
         echo "  2. 修改 PSK"
         echo "  3. TFO 开关"
+        echo "  4. 修改 mode"
+        [ "$mode" = "default" ] && echo "  5. 修改 Obfs Host"
         echo "  0. 返回"
         hr
         read -p "请选择操作: " c; echo ""
@@ -968,6 +1016,59 @@ snell_modify_menu() {
                 fi
                 systemctl restart snell
                 ;;
+            4)
+                local cur_mode=$(snell_get "mode")
+                [ -z "$cur_mode" ] && cur_mode="default"
+                echo -e "当前 mode：${CYAN}${cur_mode}${PLAIN}"
+                echo "  1. default    - 流量混淆 + AES 加密"
+                echo "  2. unshaped   - 仅 AES 加密，性能提升约10%"
+                echo "  3. unsafe-raw - 明文，仅限内网/安全隧道"
+                read -p "请选择 [1-3]: " nm
+                local new_mode
+                case "$nm" in
+                    2) new_mode="unshaped"   ;;
+                    3) new_mode="unsafe-raw" ;;
+                    *) new_mode="default"    ;;
+                esac
+                snell_set "mode" "$new_mode"
+                if [ "$new_mode" = "default" ]; then
+                    snell_set "obfs" "http"
+                    local cur_obfs_host=$(snell_get "obfs-host")
+                    echo -e "当前 Obfs Host：${CYAN}${cur_obfs_host:-未设置}${PLAIN}"
+                    read -p "Obfs Host [默认 icloud.com，输入 none 清除]: " inp_oh
+                    inp_oh="${inp_oh:-icloud.com}"
+                    if [ "$inp_oh" = "none" ]; then
+                        snell_del "obfs-host"
+                    else
+                        snell_set "obfs-host" "$inp_oh"
+                    fi
+                else
+                    # 切换到非混淆 mode，清除 obfs 相关配置
+                    snell_del "obfs"
+                    snell_del "obfs-host"
+                fi
+                systemctl restart snell
+                echo -e "${GREEN}mode 已改为 ${new_mode}${PLAIN}"
+                echo -e "${YELLOW}注意：请确保 Surge 客户端 mode 设置与服务端一致${PLAIN}"
+                ;;
+            5)
+                local cur_mode=$(snell_get "mode")
+                [ -z "$cur_mode" ] && cur_mode="default"
+                if [ "$cur_mode" != "default" ]; then
+                    echo -e "${RED}仅 default mode 支持 Obfs Host${PLAIN}"
+                else
+                    local cur_oh=$(snell_get "obfs-host")
+                    echo -e "当前 Obfs Host：${CYAN}${cur_oh:-未设置}${PLAIN}"
+                    read -p "新 Obfs Host [输入 none 清除]: " inp_oh
+                    if [ "$inp_oh" = "none" ]; then
+                        snell_del "obfs-host"
+                        echo -e "${GREEN}Obfs Host 已清除${PLAIN}"
+                    elif [ -n "$inp_oh" ]; then
+                        snell_set "obfs-host" "$inp_oh"
+                        echo -e "${GREEN}Obfs Host 已改为 ${inp_oh}${PLAIN}"
+                    fi
+                fi
+                ;;
             0) return ;;
             *) echo -e "${RED}无效选项${PLAIN}" ;;
         esac
@@ -979,8 +1080,8 @@ ss_modify_menu() {
     while true; do
         clear; hr
         local port=$(ss_get "server_port")
-        local tfo=$(ss_get "fast_open")
-        local tfo_s; [ "$tfo" = "True" ] && tfo_s="${GREEN}开启${PLAIN}" || tfo_s="${YELLOW}关闭${PLAIN}"
+        local tfo_s
+        ss_tfo_enabled && tfo_s="${GREEN}开启${PLAIN}" || tfo_s="${YELLOW}关闭${PLAIN}"
         echo -e "  修改 SS2022 | 端口: ${port} | TFO: ${tfo_s}"
         hr
         echo "  1. 修改端口"
@@ -1012,11 +1113,12 @@ ss_modify_menu() {
                 echo -e "${GREEN}密码已修改${PLAIN}"
                 ;;
             3)
-                if [ "$(ss_get fast_open)" = "True" ]; then
+                # BUG FIX: 使用 ss_tfo_enabled 统一判断，写入用 python bool
+                if ss_tfo_enabled; then
                     ss_del_key "fast_open"
                     echo -e "${GREEN}TFO 已关闭${PLAIN}"
                 else
-                    ss_set_bool "fast_open" "True"
+                    ss_set_bool "fast_open" "True"  # Python bool True → JSON true
                     echo -e "${GREEN}TFO 已开启${PLAIN}"
                 fi
                 systemctl restart ss2022
@@ -1027,7 +1129,6 @@ ss_modify_menu() {
         press_enter
     done
 }
-
 
 anytls_modify_menu() {
     while true; do
@@ -1126,9 +1227,11 @@ status_menu() {
         echo "  协议状态"
         hr
         if snell_installed; then
-            local sv=$(snell_version); local sv_s
+            local sv=$(snell_version)
+            local sm=$(snell_get "mode"); [ -z "$sm" ] && sm="default"
+            local sv_s
             snell_running && sv_s="${GREEN}运行中${PLAIN}" || sv_s="${RED}未运行${PLAIN}"
-            echo -e "  Snell   |  ${sv_s}  |  ${sv}  |  端口: $(snell_port)"
+            echo -e "  Snell   |  ${sv_s}  |  ${sv}  |  端口: $(snell_port)  |  mode: ${sm}"
         fi
         if ss_installed; then
             local sv2=$(ss_version); local ss_s
