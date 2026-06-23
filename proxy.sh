@@ -203,7 +203,6 @@ snell_surge_line() {
     local psk=$(snell_get "psk")
     local tfo=$(snell_get "tfo")
     local mode=$(snell_get "mode")
-    local obfs_host=$(snell_get "obfs-host")
     local ip=$(get_ip)
     local country=$(get_country "$ip")
     local bin_ver=$(snell_version)
@@ -212,12 +211,9 @@ snell_surge_line() {
     local line="${country} = snell, ${ip}, ${port}, psk = ${psk}, version = ${ver}, reuse = true, ecn = true"
     [ "$tfo" = "true" ] && line="${line}, tfo = true"
     # mode：非 default 时才写（default 是默认值）
+    # Snell v6 没有 obfs / obfs-host 参数，混淆行为由 PSK 自动派生，
+    # 仅通过 mode（default/unshaped/unsafe-raw）控制，客户端和服务端的 mode 需一致。
     [ -n "$mode" ] && [ "$mode" != "default" ] && line="${line}, mode = ${mode}"
-    # default mode 加 obfs，obfs-host 只是客户端伪装用，服务端不校验
-    if [ -z "$mode" ] || [ "$mode" = "default" ]; then
-        line="${line}, obfs = http"
-        [ -n "$obfs_host" ] && line="${line}, obfs-host = ${obfs_host}"
-    fi
     echo "$line"
 }
 
@@ -500,7 +496,9 @@ snell_latest_version() {
 
 # =============================================
 # Snell 安装
-# 新增：mode 参数支持（v6 beta3）
+# mode 参数支持（v6 beta3+）
+# BUG FIX: 移除 obfs / obfs-host —— Snell v6 协议中不存在这两个参数，
+# 混淆行为已由 PSK 自动派生，只能通过 mode 控制。
 # =============================================
 
 snell_install() {
@@ -531,7 +529,7 @@ snell_install() {
     local tfo="true"
     [ "${inp_tfo,,}" = "n" ] && tfo="false"
 
-    # 新增：mode 选择
+    # mode 选择（Snell v6 唯一的混淆/加密强度开关，不再有 obfs 参数）
     echo ""
     echo -e "${CYAN}选择 mode（服务端与客户端须一致）：${PLAIN}"
     echo "  1. default    - 流量混淆 + AES 加密（推荐）"
@@ -544,14 +542,6 @@ snell_install() {
         3) mode="unsafe-raw" ;;
         *) mode="default"    ;;
     esac
-
-    local obfs_host=""
-    if [ "$mode" = "default" ]; then
-        echo ""
-        read -p "Obfs Host [默认 icloud.com，输入 none 不设置]: " inp_obfs_host
-        inp_obfs_host="${inp_obfs_host:-icloud.com}"
-        [ "$inp_obfs_host" != "none" ] && obfs_host="$inp_obfs_host"
-    fi
 
     install_deps
 
@@ -582,11 +572,6 @@ ipv6 = true
 dns-ip-preference = prefer-ipv6
 EOF
     [ "$tfo" = "true" ] && echo "tfo = true" >> "$SNELL_CONF"
-    # default mode 写入 obfs，obfs-host 供节点生成使用
-    if [ "$mode" = "default" ]; then
-        echo "obfs = http" >> "$SNELL_CONF"
-        [ -n "$obfs_host" ] && echo "obfs-host = ${obfs_host}" >> "$SNELL_CONF"
-    fi
 
     cat > "$SNELL_SERVICE" << EOF
 [Unit]
@@ -964,16 +949,14 @@ snell_modify_menu() {
         local port=$(snell_port)
         local tfo=$(snell_get "tfo")
         local mode=$(snell_get "mode")
-        local obfs_host=$(snell_get "obfs-host")
         local tfo_s; [ "$tfo" = "true" ] && tfo_s="${GREEN}开启${PLAIN}" || tfo_s="${YELLOW}关闭${PLAIN}"
         [ -z "$mode" ] && mode="default"
-        echo -e "  修改 Snell | 端口: ${port} | TFO: ${tfo_s} | mode: ${mode} | obfs-host: ${obfs_host:-未设置}"
+        echo -e "  修改 Snell | 端口: ${port} | TFO: ${tfo_s} | mode: ${mode}"
         hr
         echo "  1. 修改端口"
         echo "  2. 修改 PSK"
         echo "  3. TFO 开关"
         echo "  4. 修改 mode"
-        [ "$mode" = "default" ] && echo "  5. 修改 Obfs Host"
         echo "  0. 返回"
         hr
         read -p "请选择操作: " c; echo ""
@@ -1031,43 +1014,12 @@ snell_modify_menu() {
                     *) new_mode="default"    ;;
                 esac
                 snell_set "mode" "$new_mode"
-                if [ "$new_mode" = "default" ]; then
-                    snell_set "obfs" "http"
-                    local cur_obfs_host=$(snell_get "obfs-host")
-                    echo -e "当前 Obfs Host：${CYAN}${cur_obfs_host:-未设置}${PLAIN}"
-                    read -p "Obfs Host [默认 icloud.com，输入 none 清除]: " inp_oh
-                    inp_oh="${inp_oh:-icloud.com}"
-                    if [ "$inp_oh" = "none" ]; then
-                        snell_del "obfs-host"
-                    else
-                        snell_set "obfs-host" "$inp_oh"
-                    fi
-                else
-                    # 切换到非混淆 mode，清除 obfs 相关配置
-                    snell_del "obfs"
-                    snell_del "obfs-host"
-                fi
+                # 清理历史遗留的 obfs / obfs-host（v6 不存在这两个参数）
+                snell_del "obfs"
+                snell_del "obfs-host"
                 systemctl restart snell
                 echo -e "${GREEN}mode 已改为 ${new_mode}${PLAIN}"
                 echo -e "${YELLOW}注意：请确保 Surge 客户端 mode 设置与服务端一致${PLAIN}"
-                ;;
-            5)
-                local cur_mode=$(snell_get "mode")
-                [ -z "$cur_mode" ] && cur_mode="default"
-                if [ "$cur_mode" != "default" ]; then
-                    echo -e "${RED}仅 default mode 支持 Obfs Host${PLAIN}"
-                else
-                    local cur_oh=$(snell_get "obfs-host")
-                    echo -e "当前 Obfs Host：${CYAN}${cur_oh:-未设置}${PLAIN}"
-                    read -p "新 Obfs Host [输入 none 清除]: " inp_oh
-                    if [ "$inp_oh" = "none" ]; then
-                        snell_del "obfs-host"
-                        echo -e "${GREEN}Obfs Host 已清除${PLAIN}"
-                    elif [ -n "$inp_oh" ]; then
-                        snell_set "obfs-host" "$inp_oh"
-                        echo -e "${GREEN}Obfs Host 已改为 ${inp_oh}${PLAIN}"
-                    fi
-                fi
                 ;;
             0) return ;;
             *) echo -e "${RED}无效选项${PLAIN}" ;;
