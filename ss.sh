@@ -2,6 +2,7 @@
 
 # Shadowsocks 2022 interactive installer based on shadowsocks-rust.
 # Run without arguments to open a Snell-like management menu.
+# 作者 @Reukix https://github.com/Reukix
 
 set -euo pipefail
 
