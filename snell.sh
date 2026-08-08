@@ -3,7 +3,6 @@
 #================================================================
 # Snell v6 一键部署脚本
 # 支持自动检测架构、下载、安装、配置和启动 Snell 服务
-# 作者 @Reukix https://github.com/Reukix
 #================================================================
 
 set -e
@@ -16,7 +15,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # 配置变量
-SNELL_VERSION_V6="v6.0.0rc"
+SNELL_VERSION_V6="v6.0.0rc2"
 SNELL_VERSION_V5="v5.0.1"
 SNELL_VERSION=""
 INSTALL_DIR="/usr/local/bin"
