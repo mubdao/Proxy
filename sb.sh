@@ -1,57 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # Sing-box 精简管理脚本（sb-mini.sh）
-#
-# 基于 Tangfffyx/sing-box (sb.sh, SCRIPT_VERSION 6.1.7) 二次开发精简而来。
-#
-# 【复用声明 / 来源标注】
-# 以下函数是从原仓库 sb.sh 逐字复制而来，未做任何逻辑修改：
-#   - ensure_self_signed_cert / get_tls_domain_candidates /
-#     benchmark_tls_domain_ms / auto_pick_tls_domain / choose_tls_domain
-#     （AnyTLS 域名选择 / 自动测速 / 手动输入 / 证书生成 —— 原样保留）
-#   - build_anytls_inbound （AnyTLS inbound 构建器 —— 原样保留）
-#   - config_normalize / config_load / config_ensure_exists /
-#     check_config_or_print / reload_or_restart_singbox_safe /
-#     enable_now_singbox_safe / with_manager_lock / config_apply /
-#     _config_apply_body （写入 -> check -> 重启 -> 失败回滚 的安全管线 —— 原样保留，
-#     仅删除了原版里跟用户流量统计模块耦合的 sync_user_usage_counters 调用）
-#   - entry_key_prefix_by_type / entry_key_from_parts /
-#     entry_key_to_protocol_label / entry_key_to_port /
-#     find_inbound_by_entry_key / protocol_entry_inventory
-#     （协议 entry_key 体系与清单查询 —— 原样保留，协议注册表已精简为
-#     仅 anytls + shadowsocks 两项）
-#   - 基础 UI/工具函数（say/ok/warn/err/pause/print_rect_title/
-#     pad_display_text/text_display_width/has_cmd/random_b64_password/
-#     is_valid_port/ask_port_or_return/ask_confirm_yn/detect_pkg_manager/
-#     detect_init_system/pkg_installed/pkg_update_once/install_pkg/
-#     singbox_service_active/get_public_ip/download_file 系列）—— 原样保留。
-#
-# 【新增部分】（原仓库没有、按需求新增的功能）
-#   - build_ss_inbound：改为支持多种 Shadowsocks method 的单密钥版本
-#     （原版是为配合"多用户系统"设计的 2022 双密钥/多用户 users[] 结构，
-#     这里不需要多用户，所以改为标准单用户 sing-box shadowsocks 配置）
-#   - ss_method_key_bytes / ss_supported_methods / ss_gen_password_for_method /
-#     ss_validate_password_for_method：SS 加密方式 -> 所需密钥长度的对照表，
-#     用于生成/校验密码长度；最终是否真的被当前 sing-box 版本支持，
-#     仍然以 `sing-box check` 的结果为准（写入前必须校验通过才会真正落盘）。
-#   - remove_inbound_by_entry_key_simple：简化版删除（因为已删除中转/多用户/
-#     WARP，不再需要清理 auth_user 路由规则和衍生 outbound）。
-#   - ss_add/ss_modify/ss_delete/ss_list、anytls_add/anytls_modify/
-#     anytls_delete/anytls_list、主菜单、安装/卸载：全部是菜单编排/胶水代码，
-#     内部只是调用上面"原样保留"的函数，不包含任何自研的 AnyTLS 部署逻辑。
-#   - install_singbox/uninstall_singbox：因为本次开发环境无法访问原仓库
-#     lib/ 目录下的安装模块源码，这部分是参照原脚本里出现的同类逻辑
-#     （GitHub Releases 下载 + systemd 单元 + 包管理器装依赖）重新实现的，
-#     不是逐字复制。如果你的 VPS 已经装好了 sing-box，可以直接跳过安装，
-#     只用这个脚本做节点管理。
-#
-# 【关于对 Tangfffyx/sing-box 仓库的依赖】
-#   本脚本运行时不 source 任何外部文件，所有函数都在这一个文件里，
-#   跟原仓库的 lib/ 目录、build.sh 完全无关，原仓库不存在了也照常运行。
-#   唯一会联网访问 GitHub 的地方是「安装/更新 sing-box」，而这里拉取的是
-#   官方 SagerNet/sing-box 的 release 二进制，不依赖 Tangfffyx/sing-box。
 # ============================================================
-
 set -Eeuo pipefail
 
 # -------------------- 路径常量 --------------------
