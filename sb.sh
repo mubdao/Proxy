@@ -240,7 +240,9 @@ install_singbox() {
     echo -e "${CYAN}=====================================================${NC}"
 
     if command -v sing-box &>/dev/null; then
-        log_info "已安装，无需重复安装"
+        local cur_ver
+        cur_ver=$(get_singbox_version)
+        log_info "已安装，无需重复安装 (当前版本: v${cur_ver:-未知})"
         pause
         return
     fi
@@ -265,12 +267,24 @@ update_singbox() {
     pause
 }
 
+# 获取当前已安装的 Sing-Box 版本号
+get_singbox_version() {
+    sing-box version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([a-zA-Z0-9.\-]*)?' | head -n 1
+}
+
 manage_component() {
     clear
     echo -e "${CYAN}=====================================================${NC}"
     echo -e "${BOLD}              Sing-Box 组件管理                     ${NC}"
     echo -e "${CYAN}=====================================================${NC}"
-    echo -e " 1. 安装 Sing-Box"
+
+    if command -v sing-box &>/dev/null; then
+        local cur_ver
+        cur_ver=$(get_singbox_version)
+        echo -e " 1. 安装 Sing-Box ${GREEN}(已安装 v${cur_ver:-未知})${NC}"
+    else
+        echo -e " 1. 安装 Sing-Box"
+    fi
     echo -e " 2. 更新 Sing-Box"
     echo -e " 0. 返回主菜单"
     echo -e "${CYAN}-----------------------------------------------------${NC}"
