@@ -1,3 +1,5 @@
+这是根据 Snell 脚本目前实际逻辑写的说明，可以直接发给用户或放进 README。
+
 ---
 
 ## 📦 首次安装使用
@@ -7,6 +9,22 @@
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/snell.sh)
 ```
+
+**2. 首次运行后会自动进入菜单，选 `1. 安装 / 重构节点` 即可完成全部部署：**
+
+```
+1. 安装 / 重构节点   ← 选这个，按提示填端口 / PSK（可回车用默认值/自动生成），装好即用
+```
+
+装完会自动启动服务，并打印出 Surge 格式的节点信息（`snell, IP, 端口, psk=..., version=...`）。
+
+**3. 以后想再打开脚本，直接在终端输入：**
+
+```bash
+snell
+```
+
+不用再重新下载，`snell` 命令会自动唤醒本地已保存好的脚本（`/root/snell.sh`）。
 
 ---
 
