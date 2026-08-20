@@ -51,8 +51,8 @@ force_register_shortcut() {
 
     # 防止管道运行时 $0 无法被读取，如果在 /root/sb.sh 仍为空，尝试重新抓取下载
     if [[ ! -s "$LOCAL_SCRIPT_PATH" ]]; then
-        curl -fsSL https://raw.githubusercontent.com/xymn2023/AnyTLS/main/sb.sh -o "$LOCAL_SCRIPT_PATH" 2>/dev/null || \
-        wget -qO "$LOCAL_SCRIPT_PATH" https://raw.githubusercontent.com/xymn2023/AnyTLS/main/sb.sh 2>/dev/null || true
+        curl -fsSL https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/sb.sh -o "$LOCAL_SCRIPT_PATH" 2>/dev/null || \
+        wget -qO "$LOCAL_SCRIPT_PATH" https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/sb.sh 2>/dev/null || true
     fi
 
     chmod +x "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
@@ -70,7 +70,7 @@ force_register_shortcut() {
 if [[ -f /root/sb.sh ]]; then
     bash /root/sb.sh "$@"
 else
-    bash <(curl -fsSL https://raw.githubusercontent.com/xymn2023/AnyTLS/main/sb.sh) "$@"
+    bash <(curl -fsSL https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/sb.sh) "$@"
 fi
 EOF
         chmod +x "$path" 2>/dev/null || true
