@@ -1,37 +1,35 @@
-# Proxy Scripts Collection
+---
 
-支持 **Sing-Box** 与 **Snell** 的轻量级 Linux 部署与管理脚本。
+## 📦 首次安装使用
+
+**1. 安装脚本（需要 root 权限）**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/snell.sh)
+```
 
 ---
 
-## 🚀 Sing-Box 脚本
+## 🗑️ 完全卸载（清空所有内容 + 脚本本身）
 
-### 安装
+**方法一：脚本内菜单卸载（推荐）**
 
 ```bash
-bash <(curl -fsSL [https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/sb.sh](https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/sb.sh))
+snell
+```
+进菜单后选 `6. 卸载 Snell`，输入 `y` 确认。这一步会自动删除：
+- Snell 服务、二进制文件（`snell-server`）
+- 节点配置文件（`/etc/snell/snell-server.conf`）
+- 节点信息文件（`/root/.snell_info.json`）
+- 脚本本体（`/root/snell.sh`）
+- `snell` 快捷命令（`/usr/local/bin/snell`、`/usr/bin/snell`）
 
-卸载
- * 菜单卸载：运行 sb 后选择 7. 卸载 Sing-Box
- * 一键卸载：
-   bash -c '
-systemctl stop sing-box 2>/dev/null
-systemctl disable sing-box 2>/dev/null
-rm -f /etc/systemd/system/sing-box.service
-rm -f /usr/bin/sing-box /usr/local/bin/sing-box /usr/local/bin/sb /usr/bin/sb /root/sb.sh
-rm -rf /etc/sing-box /root/.sb_info.json /root/AnyTLS
-systemctl daemon-reload
-echo "Sing-Box 及脚本组件已彻底卸载完成！"
-'
+卸载完成后，`snell` 命令也会同步失效，等于彻底清干净，不留任何痕迹。
 
-⚡ Snell 脚本
-安装
-bash <(curl -fsSL [https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/snell.sh](https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/snell.sh))
+**方法二：一键非交互卸载（不进菜单，适合脚本化/远程执行）**
 
-卸载
- * 菜单卸载：运行 snell 后选择 6. 卸载 Snell
- * 一键卸载：
-   bash -c '
+```bash
+bash -c '
 systemctl stop snell.service 2>/dev/null
 systemctl disable snell.service 2>/dev/null
 rm -f /etc/systemd/system/snell.service
@@ -40,5 +38,6 @@ rm -f /etc/snell/snell-server.conf /root/.snell_info.json
 systemctl daemon-reload
 echo "Snell 及脚本组件已彻底卸载完成！"
 '
+```
 
-
+两种方法效果完全一致，方法一更安全（有二次确认），方法二适合不想交互、直接一条命令跑完的场景。
