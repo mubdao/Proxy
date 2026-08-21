@@ -1,4 +1,4 @@
-# 极简 VPS 系统管理脚本 V2
+# 极简 VPS 系统管理
 
 适用于 Debian / Ubuntu 的一体化 VPS 管理工具，提供 BBR 加速、IPv4/IPv6 出入站设置、DNS 管理、Swap 配置、系统时间/NTP、安全磁盘清理等功能。
 
