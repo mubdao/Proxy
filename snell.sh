@@ -11,6 +11,8 @@ readonly INFO_PATH="/root/.snell_info.json"
 readonly LOCAL_SCRIPT_PATH="/root/snell.sh"
 readonly BINARY_PATH="/usr/local/bin/snell-server"
 readonly GITHUB_RELEASES_API="https://api.github.com/repos/passeway/Snell/releases?per_page=100"
+readonly SNELL_USER="snell"
+readonly SNELL_GROUP="snell"
 
 # 颜色与样式
 readonly RED='\033[0;31m'
@@ -104,11 +106,20 @@ check_and_print_port_status() {
     log_success "检测到端口 ${port} ${GREEN}未被占用${NC}，可以使用。"
 }
 
+# FIX #5: 公网 IP 获取增加备用源，且明确警告 fallback 情况，
+# 避免生成一份指向 127.0.0.1 的无效节点配置却不告知用户。
 get_public_ip() {
     local ip
     ip=$(curl -s4 --connect-timeout 5 ifconfig.me 2>/dev/null || true)
     [[ -z "$ip" ]] && ip=$(curl -s6 --connect-timeout 5 ifconfig.me 2>/dev/null || true)
-    echo "${ip:-127.0.0.1}"
+    [[ -z "$ip" ]] && ip=$(curl -s4 --connect-timeout 5 https://api.ip.sb/ip 2>/dev/null || true)
+    [[ -z "$ip" ]] && ip=$(curl -s4 --connect-timeout 5 https://ipinfo.io/ip 2>/dev/null || true)
+
+    if [[ -z "$ip" ]]; then
+        log_warn "未能获取到公网 IP，节点配置中的地址将回退为 127.0.0.1，请手动替换为服务器真实 IP！" >&2
+        ip="127.0.0.1"
+    fi
+    echo "$ip"
 }
 
 open_firewall_port() {
@@ -124,6 +135,22 @@ open_firewall_port() {
         firewall-cmd --zone=public --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
         log_success "Firewalld 防火墙端口 ${port} 放行成功！"
+    fi
+}
+
+# FIX #4: 卸载时对称地收回防火墙端口规则，避免卸载后端口仍对外开放。
+close_firewall_port() {
+    local port="$1"
+    [[ -z "$port" ]] && return 0
+    log_info "正在收回防火墙端口 ${port}..."
+
+    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+        ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+        ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+        firewall-cmd --zone=public --remove-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --zone=public --remove-port="${port}/udp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 }
 
@@ -159,13 +186,27 @@ install_dependencies() {
     fi
 }
 
+# FIX #1: 创建专用的非登录系统账户，供 systemd 服务以非 root 身份运行。
+create_service_user() {
+    if ! getent group "$SNELL_GROUP" &>/dev/null; then
+        groupadd --system "$SNELL_GROUP"
+    fi
+    if ! id -u "$SNELL_USER" &>/dev/null; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --gid "$SNELL_GROUP" "$SNELL_USER"
+        log_success "已创建专用运行账户 ${SNELL_USER}（非登录、无 shell）。"
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 动态获取官方最新 Release
 # ------------------------------------------------------------------------------
+# FIX #2 (部分): GitHub API 调用增加重试与退避，缓解匿名限流下的偶发失败。
 get_latest_release_json() {
     local releases_json
 
     releases_json=$(curl -fsSL \
+        --retry 3 --retry-delay 2 --retry-connrefused \
         -H "Accept: application/vnd.github+json" \
         -H "User-Agent: snell-installer" \
         "$GITHUB_RELEASES_API") || {
@@ -175,7 +216,7 @@ get_latest_release_json() {
 
     echo "$releases_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1 || {
         if echo "$releases_json" | jq -e '.message // "" | test("rate limit"; "i")' >/dev/null 2>&1; then
-            log_error "GitHub API 请求过于频繁，已触发限流，请稍后再试。"
+            log_error "GitHub API 请求过于频繁，已触发限流，请稍后再试（匿名请求每小时上限 60 次）。"
         else
             log_error "获取到的 Release 数据无效或为空。"
         fi
@@ -234,6 +275,71 @@ find_release_asset() {
     fi
 
     echo "$asset_url"
+}
+
+# FIX #2 (部分): 尝试在同一 Release 中寻找官方发布的校验和文件
+# （如 SHA256SUMS / checksums.txt 等常见命名）。Snell 官方目前不一定发布，
+# 找不到时明确告知用户，而不是静默跳过完整性校验。
+find_checksum_asset() {
+    local release_json="$1"
+
+    echo "$release_json" | jq -r '
+        .assets[]
+        | select((.name | ascii_downcase | test("sha256|checksum")))
+        | .browser_download_url
+    ' | head -n 1
+}
+
+verify_checksum() {
+    local archive_path="$1"
+    local checksum_url="$2"
+    local archive_name
+    archive_name=$(basename "$archive_path")
+
+    if [[ -z "$checksum_url" || "$checksum_url" == "null" ]]; then
+        local actual
+        actual=$(sha256sum "$archive_path" | awk '{print $1}')
+        log_warn "官方 Release 未提供校验和文件，无法自动验证完整性。"
+        log_warn "已下载文件的 SHA256: ${actual}"
+        log_warn "建议自行与官方渠道公布的哈希比对后再继续使用。"
+        return 0
+    fi
+
+    local checksum_file="${archive_path}.sha256list"
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$checksum_file" "$checksum_url"; then
+        log_warn "校验和文件下载失败，跳过完整性校验。"
+        return 0
+    fi
+
+    local expected
+    expected=$(grep -F "$archive_name" "$checksum_file" 2>/dev/null | awk '{print $1}' | head -n 1)
+    if [[ -z "$expected" ]]; then
+        log_warn "校验和文件中未找到 ${archive_name} 对应条目，跳过完整性校验。"
+        return 0
+    fi
+
+    local actual
+    actual=$(sha256sum "$archive_path" | awk '{print $1}')
+    if [[ "$expected" != "$actual" ]]; then
+        log_error "文件完整性校验失败！期望: ${expected}，实际: ${actual}"
+        return 1
+    fi
+
+    log_success "文件完整性校验通过 (SHA256 匹配)。"
+}
+
+# FIX #3: 解压前检查压缩包内条目，拒绝包含路径穿越（../）或绝对路径的条目，
+# 防止恶意/被篡改的 zip 覆盖任意系统文件（zip slip）。
+check_zip_safety() {
+    local archive_path="$1"
+    local bad_entries
+
+    bad_entries=$(unzip -Z1 "$archive_path" 2>/dev/null | grep -E '(^/|(^|/)\.\.(/|$))' || true)
+    if [[ -n "$bad_entries" ]]; then
+        log_error "检测到压缩包内存在不安全的路径条目，已阻止解压："
+        echo "$bad_entries" | sed 's/^/  - /'
+        return 1
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -313,6 +419,8 @@ configure_mode() {
     done
 }
 
+# FIX #1: 配置文件改为 root:snell 640，服务账户可读但其他本地用户不可读，
+# 同时避免服务进程以 root 身份直接持有对配置文件的写权限。
 write_config() {
     local port="$1"
     local psk="$2"
@@ -327,10 +435,22 @@ write_config() {
             echo "mode = ${SNELL_MODE}"
         fi
     } > "$CONFIG_PATH"
-    chmod 600 "$CONFIG_PATH"
+    chown root:"$SNELL_GROUP" "$CONFIG_PATH"
+    chmod 640 "$CONFIG_PATH"
 }
 
+# FIX #1: systemd unit 增加运行账户与基础加固指令。
+# 若端口 < 1024，通过 AmbientCapabilities 精确授予 CAP_NET_BIND_SERVICE，
+# 而不是让整个进程以 root 运行。
 write_systemd_service() {
+    local port="$1"
+    local bind_low_port_caps=""
+
+    if (( port < 1024 )); then
+        bind_low_port_caps="AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+    fi
+
     cat > "$SERVICE_PATH" << EOF2
 [Unit]
 Description=Snell Server
@@ -339,10 +459,25 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=${SNELL_USER}
+Group=${SNELL_GROUP}
 ExecStart=${BINARY_PATH} -c ${CONFIG_PATH}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
+
+# --- 安全加固 ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+${bind_low_port_caps}
 
 [Install]
 WantedBy=multi-user.target
@@ -359,6 +494,7 @@ install_node() {
     echo -e "${CYAN}=====================================================${NC}"
 
     install_dependencies || return
+    create_service_user
     local arch
     arch=$(get_arch) || return
 
@@ -371,6 +507,9 @@ install_node() {
 
     local asset_url
     asset_url=$(find_release_asset "$release_json" "$arch") || { pause; return; }
+
+    local checksum_url
+    checksum_url=$(find_checksum_asset "$release_json")
 
     echo -e "\n${CYAN}-----------------------------------------------------${NC}"
     echo -e " 最新版本: ${GREEN}${RELEASE_NAME}${NC}"
@@ -413,12 +552,24 @@ install_node() {
     archive_path="${tmp_dir}/snell.zip"
 
     log_info "正在下载官方 Snell ${RELEASE_TAG}..."
-    curl -fL --connect-timeout 10 --retry 3 -o "$archive_path" "$asset_url" || {
+    curl -fL --connect-timeout 10 --retry 3 --retry-delay 2 -o "$archive_path" "$asset_url" || {
         log_error "Snell 官方程序下载失败。"
         rm -rf "$tmp_dir"
         pause
         return
     }
+
+    if ! verify_checksum "$archive_path" "$checksum_url"; then
+        rm -rf "$tmp_dir"
+        pause
+        return
+    fi
+
+    if ! check_zip_safety "$archive_path"; then
+        rm -rf "$tmp_dir"
+        pause
+        return
+    fi
 
     log_info "正在安装 Snell Server..."
     rm -f "$BINARY_PATH"
@@ -447,7 +598,7 @@ install_node() {
     rm -rf "$tmp_dir"
 
     write_config "$port" "$psk"
-    write_systemd_service
+    write_systemd_service "$port"
     jq -n \
         --arg version "$RELEASE_TAG" \
         --arg name "$RELEASE_NAME" \
@@ -471,7 +622,7 @@ install_node() {
         return
     fi
 
-    log_success "Snell ${RELEASE_TAG} 安装与配置完成！"
+    log_success "Snell ${RELEASE_TAG} 安装与配置完成！（以非 root 账户 ${SNELL_USER} 运行）"
     pause
     show_links
 }
@@ -594,12 +745,28 @@ uninstall_all() {
     read -rp " 确定要彻底卸载 Snell 及其配置文件吗？[y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         log_info "正在清理并卸载..."
+
+        # FIX #4: 卸载前先读取端口并收回防火墙规则，避免卸载后端口仍对外暴露。
+        local port=""
+        [[ -f "$INFO_PATH" ]] && port=$(jq -r '.port // ""' "$INFO_PATH" 2>/dev/null || true)
+        [[ -n "$port" ]] && close_firewall_port "$port"
+
         systemctl stop snell.service >/dev/null 2>&1 || true
         systemctl disable snell.service >/dev/null 2>&1 || true
         rm -f "$SERVICE_PATH" "$BINARY_PATH"
         rm -f /usr/local/bin/snell /usr/bin/snell
         rm -f "$CONFIG_PATH" "$INFO_PATH" "$LOCAL_SCRIPT_PATH"
+        rmdir "$(dirname "$CONFIG_PATH")" 2>/dev/null || true
         systemctl daemon-reload
+
+        # 专用运行账户不持有任何其他数据，一并清理；如需保留可注释掉这两行。
+        if id -u "$SNELL_USER" &>/dev/null; then
+            userdel "$SNELL_USER" >/dev/null 2>&1 || true
+        fi
+        if getent group "$SNELL_GROUP" &>/dev/null; then
+            groupdel "$SNELL_GROUP" >/dev/null 2>&1 || true
+        fi
+
         log_success "Snell 及脚本组件已彻底清理卸载完成！"
     else
         log_info "已取消卸载。"
