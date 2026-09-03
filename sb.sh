@@ -44,12 +44,10 @@ check_root() {
 # 强制性全局注册函数 ('sb' 命令)
 # ------------------------------------------------------------------------------
 force_register_shortcut() {
-    # 1. 强制将当前运行的脚本实体物理写入到 /root/sb.sh
     if [[ -s "$0" ]]; then
         cp -f "$0" "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
     fi
 
-    # 防止管道运行时 $0 无法被读取，如果在 /root/sb.sh 仍为空，尝试重新抓取下载
     if [[ ! -s "$LOCAL_SCRIPT_PATH" ]]; then
         curl -fsSL https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/sb.sh -o "$LOCAL_SCRIPT_PATH" 2>/dev/null || \
         wget -qO "$LOCAL_SCRIPT_PATH" https://raw.githubusercontent.com/mubdao/Proxy/refs/heads/main/sb.sh 2>/dev/null || true
@@ -57,14 +55,11 @@ force_register_shortcut() {
 
     chmod +x "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
 
-    # 2. 直接在系统的全局命令目录生成实体可执行文件 /usr/local/bin/sb 与 /usr/bin/sb
     local target_paths=("/usr/local/bin/sb" "/usr/bin/sb")
 
     for path in "${target_paths[@]}"; do
-        # 如果存在旧的同名软链接或旧文件，强行删除掉
         rm -rf "$path" 2>/dev/null || true
 
-        # 写入物理唤醒指令
         cat << 'EOF' > "$path"
 #!/usr/bin/env bash
 if [[ -f /root/sb.sh ]]; then
@@ -137,7 +132,6 @@ open_firewall_port() {
 print_system_status() {
     echo -e "${CYAN}-----------------------------------------------------${NC}"
 
-    # 检测二进制和配置文件是否存在
     if [[ -f "$CONFIG_PATH" && -f "$INFO_PATH" ]]; then
         local installed_proto=""
         if jq -e .anytls "$INFO_PATH" >/dev/null 2>&1 && jq -e .ss2022 "$INFO_PATH" >/dev/null 2>&1; then
@@ -150,7 +144,6 @@ print_system_status() {
             installed_proto="未知配置"
         fi
 
-        # 检测服务运行状态
         if systemctl is-active --quiet "$SERVICE_NAME"; then
             local pid
             pid=$(pgrep -f "sing-box" | head -n 1 || echo "未知")
@@ -206,6 +199,17 @@ update_singbox_core() {
         log_error "Sing-Box 更新失败，请检查服务器网络。"
         return 1
     fi
+}
+
+# 获取当前已安装的 Sing-Box 版本号
+get_singbox_version() {
+    sing-box version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([a-zA-Z0-9.\-]*)?' | head -n 1
+}
+
+# 获取 GitHub 上 Sing-Box 最新版本号
+get_latest_singbox_version() {
+    curl -s --connect-timeout 5 https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+        | jq -r '.tag_name' 2>/dev/null | sed 's/^v//'
 }
 
 # ------------------------------------------------------------------------------
@@ -267,11 +271,6 @@ update_singbox() {
     pause
 }
 
-# 获取当前已安装的 Sing-Box 版本号
-get_singbox_version() {
-    sing-box version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([a-zA-Z0-9.\-]*)?' | head -n 1
-}
-
 manage_component() {
     clear
     echo -e "${CYAN}=====================================================${NC}"
@@ -285,7 +284,14 @@ manage_component() {
     else
         echo -e " 1. 安装 Sing-Box"
     fi
-    echo -e " 2. 更新 Sing-Box"
+
+    local latest_ver latest_display=""
+    latest_ver=$(get_latest_singbox_version)
+    if [[ -n "$latest_ver" && "$latest_ver" != "null" ]]; then
+        latest_display=" ${GREEN}(最新版本 v${latest_ver})${NC}"
+    fi
+    echo -e " 2. 更新 Sing-Box${latest_display}"
+
     echo -e " 0. 返回主菜单"
     echo -e "${CYAN}-----------------------------------------------------${NC}"
 
@@ -332,10 +338,19 @@ configure_node() {
 
     local inbounds_json="[]"
     local info_json="{}"
+    if [[ -f "$INFO_PATH" ]]; then
+        info_json=$(cat "$INFO_PATH")
+    fi
+    if [[ -f "$CONFIG_PATH" ]]; then
+        inbounds_json=$(jq -c '.inbounds // []' "$CONFIG_PATH")
+    fi
 
     # 1) 配置 AnyTLS
     if [[ "$mode" == "1" || "$mode" == "3" ]]; then
         echo -e "\n${YELLOW}>>>> 开始配置 AnyTLS <<<<${NC}"
+
+        inbounds_json=$(echo "$inbounds_json" | jq 'map(select(.type != "anytls"))')
+        info_json=$(echo "$info_json" | jq 'del(.anytls)')
 
         local t_port
         while :; do
@@ -388,6 +403,9 @@ configure_node() {
     if [[ "$mode" == "2" || "$mode" == "3" ]]; then
         echo -e "\n${YELLOW}>>>> 开始配置 SS2022 <<<<${NC}"
 
+        inbounds_json=$(echo "$inbounds_json" | jq 'map(select(.type != "shadowsocks"))')
+        info_json=$(echo "$info_json" | jq 'del(.ss2022)')
+
         local ss_port
         while :; do
             read -rp " 请输入端口 [默认: 8388]: " ss_port
@@ -426,7 +444,6 @@ configure_node() {
         read -rp " 请输入密码 [默认: 自动生成]: " ss_pwd
         ss_pwd=${ss_pwd:-$(sing-box generate rand --base64 "$ss_key_len")}
 
-        # SS2022 密码必须是指定长度的 Base64 编码密钥。
         while :; do
             local decoded_len
             decoded_len=$(printf '%s' "$ss_pwd" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
@@ -446,7 +463,6 @@ configure_node() {
                 type: "shadowsocks",
                 listen: "::",
                 listen_port: ($p | tonumber),
-                network: "tcp",
                 method: $m,
                 password: $w,
                 multiplex: {
@@ -462,7 +478,6 @@ configure_node() {
         log_success "SS2022 参数配置完成！"
     fi
 
-    # 保存配置
     echo "$info_json" > "$INFO_PATH"
     mkdir -p "$(dirname "$CONFIG_PATH")"
     jq -n --argjson ib "$inbounds_json" '{log: {level: "info", timestamp: true}, inbounds: $ib}' > "$CONFIG_PATH"
@@ -625,7 +640,6 @@ main_menu() {
         echo -e "${BOLD}       Sing-Box (AnyTLS / SS2022) 管理脚本       ${NC}"
         echo -e "         快捷指令: 在终端输入 ${YELLOW}${BOLD}sb${NC} 即可快速打开"
         
-        # 实时检测并在面板打出运行状态
         print_system_status
 
         echo -e " ${GREEN}1.${NC} SingBox管理 (安装/更新)"
