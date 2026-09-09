@@ -628,11 +628,146 @@ install_node() {
 }
 
 # ------------------------------------------------------------------------------
+# 更新（仅替换二进制，保留现有端口 / PSK / mode 不变）
+# ------------------------------------------------------------------------------
+update_snell_version() {
+    clear
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e "${BOLD}                  更新 Snell 版本                   ${NC}"
+    echo -e "${CYAN}=====================================================${NC}"
+
+    if ! is_installed; then
+        log_warn "尚未安装 Snell，请先使用菜单中的「安装节点」。"
+        pause
+        return
+    fi
+
+    local current_version current_port current_psk current_mode current_arch
+    current_version=$(jq -r '.version // ""' "$INFO_PATH" 2>/dev/null || true)
+    current_port=$(jq -r '.port // ""' "$INFO_PATH" 2>/dev/null || true)
+    current_psk=$(jq -r '.psk // ""' "$INFO_PATH" 2>/dev/null || true)
+    current_mode=$(jq -r '.mode // ""' "$INFO_PATH" 2>/dev/null || true)
+    current_arch=$(jq -r '.arch // ""' "$INFO_PATH" 2>/dev/null || true)
+    [[ -z "$current_arch" ]] && current_arch=$(get_arch) || return
+
+    log_info "当前已安装版本: ${current_version:-未知}"
+    log_info "正在检查 Snell 官方最新 Release..."
+
+    local release_json
+    release_json=$(get_latest_release_json) || { pause; return; }
+    get_release_info "$release_json" || { pause; return; }
+
+    if [[ "$RELEASE_TAG" == "$current_version" ]]; then
+        log_success "当前已是最新版本 (${current_version})，无需更新。"
+        pause
+        return
+    fi
+
+    echo -e "${CYAN}-----------------------------------------------------${NC}"
+    echo -e " 当前版本: ${YELLOW}${current_version:-未知}${NC}"
+    echo -e " 最新版本: ${GREEN}${RELEASE_TAG}${NC}"
+    echo -e "${CYAN}-----------------------------------------------------${NC}"
+    read -rp " 确认更新到最新版本？端口 / PSK / 模式将保持不变 [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "已取消更新。"
+        pause
+        return
+    fi
+
+    local asset_url
+    asset_url=$(find_release_asset "$release_json" "$current_arch") || { pause; return; }
+
+    local checksum_url
+    checksum_url=$(find_checksum_asset "$release_json")
+
+    local tmp_dir archive_path
+    tmp_dir=$(mktemp -d)
+    archive_path="${tmp_dir}/snell.zip"
+
+    log_info "正在下载官方 Snell ${RELEASE_TAG}..."
+    curl -fL --connect-timeout 10 --retry 3 --retry-delay 2 -o "$archive_path" "$asset_url" || {
+        log_error "Snell 官方程序下载失败。"
+        rm -rf "$tmp_dir"
+        pause
+        return
+    }
+
+    if ! verify_checksum "$archive_path" "$checksum_url"; then
+        rm -rf "$tmp_dir"
+        pause
+        return
+    fi
+
+    if ! check_zip_safety "$archive_path"; then
+        rm -rf "$tmp_dir"
+        pause
+        return
+    fi
+
+    if ! unzip -oq "$archive_path" -d "$tmp_dir/extract"; then
+        log_error "官方 Snell 安装包解压失败。"
+        rm -rf "$tmp_dir"
+        pause
+        return
+    fi
+
+    local extracted_binary
+    extracted_binary=$(find "$tmp_dir/extract" -maxdepth 3 -type f -name "snell-server" | head -n 1)
+    if [[ -z "$extracted_binary" ]]; then
+        log_error "下载的官方 ZIP 中未找到 snell-server 二进制文件。"
+        rm -rf "$tmp_dir"
+        pause
+        return
+    fi
+
+    log_info "正在替换 Snell 二进制文件..."
+    systemctl stop snell.service >/dev/null 2>&1 || true
+    if ! install -m 0755 "$extracted_binary" "$BINARY_PATH"; then
+        log_error "Snell Server 二进制替换失败，尝试恢复原服务运行。"
+        systemctl start snell.service >/dev/null 2>&1 || true
+        rm -rf "$tmp_dir"
+        pause
+        return
+    fi
+    rm -rf "$tmp_dir"
+
+    # 配置文件（端口 / PSK / mode）保持不变，只更新记录的版本号。
+    jq -n \
+        --arg version "$RELEASE_TAG" \
+        --arg name "$RELEASE_NAME" \
+        --arg port "$current_port" \
+        --arg psk "$current_psk" \
+        --arg arch "$current_arch" \
+        --arg mode "$current_mode" \
+        '{version:$version,release_name:$name,port:$port,psk:$psk,arch:$arch,mode:$mode}' > "$INFO_PATH"
+    chmod 600 "$INFO_PATH"
+
+    systemctl daemon-reload
+    systemctl restart snell.service
+
+    if ! systemctl is-active --quiet snell.service; then
+        log_error "更新后服务启动失败，请查看运行状态和日志。"
+        systemctl status snell.service --no-pager || true
+        pause
+        return
+    fi
+
+    log_success "Snell 已成功更新至 ${RELEASE_TAG}（端口 / PSK / 模式保持不变）。"
+    pause
+}
+
+# ------------------------------------------------------------------------------
 # 状态展示
 # ------------------------------------------------------------------------------
+# 统一的"是否已安装"判断，供菜单文字切换、更新逻辑等复用，
+# 避免多处重复写同一个条件导致后续不一致。
+is_installed() {
+    [[ -f "$CONFIG_PATH" && -f "$INFO_PATH" && -x "$BINARY_PATH" ]]
+}
+
 print_system_status() {
     echo -e "${CYAN}-----------------------------------------------------${NC}"
-    if [[ -f "$CONFIG_PATH" && -f "$INFO_PATH" && -x "$BINARY_PATH" ]]; then
+    if is_installed; then
         local version mode
         version=$(jq -r '.version // "未知"' "$INFO_PATH" 2>/dev/null || echo "未知")
         mode=$(jq -r '.mode // ""' "$INFO_PATH" 2>/dev/null || true)
@@ -787,30 +922,39 @@ main_menu() {
         echo -e "${BOLD}                 Snell 管理脚本                     ${NC}"
         echo -e "         快捷指令: 在终端输入 ${YELLOW}${BOLD}snell${NC} 即可快速打开"
         print_system_status
-        echo -e " ${GREEN}1.${NC} 安装 / 重构节点"
-        echo -e " ${GREEN}2.${NC} 服务管理 (启动/停止/重启)"
-        echo -e " ${GREEN}3.${NC} 查看节点配置"
-        echo -e " ${GREEN}4.${NC} 查看运行状态"
-        echo -e " ${GREEN}5.${NC} 查看实时日志"
-        echo -e " ${RED}6.${NC} 卸载 Snell"
+
+        # 菜单文字按当前安装状态动态切换：未安装时显示"安装节点"，
+        # 已安装时显示"重构节点"，避免用户误以为选 1 是在做别的事。
+        if is_installed; then
+            echo -e " ${GREEN}1.${NC} 重构节点"
+        else
+            echo -e " ${GREEN}1.${NC} 安装节点"
+        fi
+        echo -e " ${GREEN}2.${NC} 更新 Snell 版本"
+        echo -e " ${GREEN}3.${NC} 服务管理 (启动/停止/重启)"
+        echo -e " ${GREEN}4.${NC} 查看节点配置"
+        echo -e " ${GREEN}5.${NC} 查看运行状态"
+        echo -e " ${GREEN}6.${NC} 查看实时日志"
+        echo -e " ${RED}7.${NC} 卸载 Snell"
         echo -e " ${YELLOW}0.${NC} 退出脚本"
         echo -e "${CYAN}=====================================================${NC}"
 
-        read -rp " 请输入选项 [0-6]: " opt
+        read -rp " 请输入选项 [0-7]: " opt
         case "$opt" in
             1) install_node ;;
-            2) manage_service ;;
-            3) show_links ;;
-            4) show_status ;;
-            5) show_logs ;;
-            6) uninstall_all ;;
+            2) update_snell_version ;;
+            3) manage_service ;;
+            4) show_links ;;
+            5) show_status ;;
+            6) show_logs ;;
+            7) uninstall_all ;;
             0)
                 clear
                 echo -e "${GREEN}感谢使用！随时输入 'snell' 唤醒本脚本。${NC}"
                 exit 0
                 ;;
             *)
-                log_error "请输入正确的选项 [0-6]"
+                log_error "请输入正确的选项 [0-7]"
                 sleep 1
                 ;;
         esac
