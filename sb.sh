@@ -2,6 +2,14 @@
 
 set -eo pipefail
 
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    echo -e "\n${RED}[ERROR]${NC} 脚本在第 ${line_no} 行发生错误，已退出 (错误码: ${exit_code})"
+    echo -e "${YELLOW}如需反馈问题，请截图上面的报错信息。${NC}"
+}
+trap 'on_error $LINENO' ERR
+
 # ------------------------------------------------------------------------------
 # 全局变量与路径定义
 # ------------------------------------------------------------------------------
@@ -162,13 +170,46 @@ print_system_status() {
 # ------------------------------------------------------------------------------
 # 依赖与环境准备
 # ------------------------------------------------------------------------------
+wait_for_apt_lock() {
+    if ! command -v fuser &>/dev/null; then
+        return
+    fi
+    local max_wait=60
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        if [[ $waited -ge $max_wait ]]; then
+            log_warn "等待 apt 锁超时 (${max_wait}秒)，仍尝试继续执行..."
+            return
+        fi
+        log_warn "检测到 apt 正被其他进程占用，等待 5 秒后重试... (已等待 ${waited}秒)"
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
+apt_get_retry() {
+    local max_attempts=3
+    local attempt=1
+    while [[ $attempt -le $max_attempts ]]; do
+        wait_for_apt_lock
+        if apt-get "$@"; then
+            return 0
+        fi
+        log_warn "命令执行失败 (第 ${attempt}/${max_attempts} 次)，5 秒后重试..."
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    log_error "多次重试后仍然失败: apt-get $*"
+    return 1
+}
+
 install_dependencies() {
     log_info "检查并安装必要依赖组件..."
     rm -f /etc/sing-box/client_info.json
 
     if command -v apt-get &>/dev/null; then
-        apt-get update -y -qq
-        apt-get install -y -qq curl jq net-tools openssl lsof
+        apt_get_retry update -y -qq
+        apt_get_retry install -y -qq curl jq net-tools openssl lsof
     elif command -v dnf &>/dev/null; then
         dnf install -y -q curl jq net-tools openssl lsof
     elif command -v yum &>/dev/null; then
