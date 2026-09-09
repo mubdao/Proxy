@@ -663,12 +663,17 @@ update_snell_version() {
         return
     fi
 
-    echo -e "${CYAN}-----------------------------------------------------${NC}"
+    echo -e "${CYAN}=====================================================${NC}"
     echo -e " 当前版本: ${YELLOW}${current_version:-未知}${NC}"
     echo -e " 最新版本: ${GREEN}${RELEASE_TAG}${NC}"
     echo -e "${CYAN}-----------------------------------------------------${NC}"
-    read -rp " 确认更新到最新版本？端口 / PSK / 模式将保持不变 [y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo -e " ${GREEN}1.${NC} 确认更新（端口 / PSK / 模式保持不变）"
+    echo -e " ${YELLOW}0.${NC} 返回主菜单"
+    echo -e "${CYAN}=====================================================${NC}"
+
+    local update_opt
+    read -rp " 请输入选项 [0-1]: " update_opt
+    if [[ "$update_opt" != "1" ]]; then
         log_info "已取消更新。"
         pause
         return
