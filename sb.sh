@@ -1087,10 +1087,10 @@ show_links() {
         fi
 
         echo -e "${GREEN}[ AnyTLS 节点 ]: ${NC}"
-        echo -e "${YELLOW}anytls://${w}@${ip}:${p}/?sni=${s}&insecure=1${t_tfo_uri}#AnyTLS_${ip}${NC}\n"
+        echo -e "${YELLOW}anytls://${w}@${ip}:${p}/?sni=${s}&insecure=1&alpn=h2%2Chttp%2F1.1${t_tfo_uri}#AnyTLS_${ip}${NC}\n"
 
         echo -e "${GREEN}[ AnyTLS 节点 (Surge) ]: ${NC}"
-        echo -e "${YELLOW}AnyTLS_${ip} = anytls, ${ip}, ${p}, password=${w}, tls=true, sni=${s}, skip-cert-verify=true${t_tfo_surge}${NC}\n"
+        echo -e "${YELLOW}AnyTLS_${ip} = anytls, ${ip}, ${p}, password=${w}, tls=true, sni=${s}, skip-cert-verify=true, alpn=\"h2,http/1.1\"${t_tfo_surge}${NC}\n"
     fi
 
     if jq -e .ss2022 "$INFO_PATH" >/dev/null 2>&1; then
